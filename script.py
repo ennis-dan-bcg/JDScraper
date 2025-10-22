@@ -18,7 +18,7 @@ jobs = []
 
 COMPANY_JOBS_PATH = "/jobs/api/seeMoreJobPostings/search"
 
-MAX_JOBS = 4000
+MAX_JOBS = 1000
 
 has_more_jobs = True
 job_next_start = 0
@@ -26,8 +26,8 @@ job_card_elements = []
 
 while (has_more_jobs and len(job_card_elements) < MAX_JOBS) :
     jsParams = {
-        "keywords" : "software engineer",
-        "f_E" : "2",
+        "keywords" : "technical engineer",
+        # "f_E" : "2",
         "start" : job_next_start,
     }
     jobs_response = requests.get(BASE_SEARCH_URL + COMPANY_JOBS_PATH,jsParams, verify=False)
