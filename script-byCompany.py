@@ -24,8 +24,9 @@ BASE_SEARCH_URL = "https://www.linkedin.com/jobs-guest"
 COMPANY_SEARCH_PATH="/api/typeaheadHits"
 
 STARTUP_COMPANY_NAMES  = ["Lovable", "Hugging Face", "Replit", "Anthropic", "Scale AI", "Glean", "Perplexity"]
-INSURANCE_COMPANY_NAMES  = ["Chubb","AIG", "The Hartford", "Farmers", "Progressive", "Nationwide", "Allstate", "Geico", "State Farm", "Zurich"]
+INSURANCE_COMPANY_NAMES  = ["Google", "Chubb","AIG", "The Hartford", "Farmers", "Progressive", "Nationwide", "Allstate", "Geico", "State Farm", "Zurich"]
 TECH_COMPANY_NAMES  = [ "Meta", "Amazon", "Alphabet", "Microsoft", "Netflix", "Nvidia", "Stripe", "Apple", "Shopify", "Walmart"]
+FI_COMPANY_NAMES = ["Morgan Stanley", "Goldman Sachs", "Bank of America", "J.P. Morgan", "JPMorganChase", "Wells Fargo", "Citi", "American Express", "Capital One", "State Street" ]
 
 ALL_COMPANY_NAMES = STARTUP_COMPANY_NAMES + INSURANCE_COMPANY_NAMES + TECH_COMPANY_NAMES
 
@@ -82,7 +83,7 @@ Return a JSON object with this structure:
 {{
   "jobs": [
     {{
-      "job_url": "the unique job URL",
+      "job_id": "the unique job ID (number only, e.g., '4316072852')",
       "extracted_info": {{
         "years_experience": "3-5" or "5+" or "Not specified",
         "education": "Bachelor's" or "Master's" or "PhD" or "Not specified",
@@ -95,7 +96,8 @@ Return a JSON object with this structure:
 
 IMPORTANT:
 - Extract metadata for ALL jobs provided (do not skip any)
-- Only return job URLs and extracted information
+- Only return job IDs and extracted information (not full URLs or job objects)
+- Job ID is the numeric identifier from the job (e.g., "4316072852")
 - Do NOT return the full job objects (descriptions, etc.) as they may be truncated
 
 Return ONLY valid JSON, no other text."""
@@ -114,17 +116,17 @@ Return ONLY valid JSON, no other text."""
             response_text = message.content[0].text
             result = json.loads(response_text)
 
-            # Create a mapping of original jobs by URL for fast lookup
-            original_jobs_by_url = {job['url']: job for job in batch}
+            # Create a mapping of original jobs by job_id for fast lookup
+            original_jobs_by_id = {job['job_id']: job for job in batch}
 
             # Process all jobs and add extracted metadata
             for job_result in result.get('jobs', []):
-                job_url = job_result['job_url']
+                job_id = job_result['job_id']
                 extracted = job_result['extracted_info']
 
                 # Find the original job object (with full data)
-                if job_url in original_jobs_by_url:
-                    original_job = original_jobs_by_url[job_url]
+                if job_id in original_jobs_by_id:
+                    original_job = original_jobs_by_id[job_id]
 
                     # Add ONLY the extracted fields to the original job
                     original_job['years_experience'] = extracted.get('years_experience', 'Not specified')
@@ -135,7 +137,7 @@ Return ONLY valid JSON, no other text."""
                     # Add to enriched list (preserving ALL original data)
                     all_enriched_jobs.append(original_job)
                 else:
-                    print(f"    WARNING: Claude returned URL not in batch: {job_url}")
+                    print(f"    WARNING: Claude returned job_id not in batch: {job_id}")
 
             print(f"    Enriched {len(result.get('jobs', []))} jobs with metadata")
 
@@ -177,25 +179,48 @@ if os.path.exists('output.json'):
     else:
         print("→ Replace mode: output.json will be overwritten")
 else:
-    print("No existing output.json found. Creating new file.")
+    print("No existing output.json found. Creating new file.")  
 print("="*50 + "\n")
 
 
-for company_name_og in STARTUP_COMPANY_NAMES:
+for company_name_og in ["Databricks", "Spotify", "Uber", "Lyft", "Doordash", "TikTok", "Pinterest", "Datadog", "DraftKings"]:
     company_jobs = []  # Collect jobs for this company
     company_search_params= {
     "typeaheadType":"COMPANY",
     "query": company_name_og
 }
 
-    company_response = requests.get(BASE_SEARCH_URL + COMPANY_SEARCH_PATH, company_search_params, verify=False)
+    # Retry logic for company lookup with exponential backoff
+    company_response = None
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            company_response = requests.get(BASE_SEARCH_URL + COMPANY_SEARCH_PATH, company_search_params, verify=False, timeout=10)
+            if company_response.status_code == 200:
+                break
+            elif company_response.status_code == 429:
+                # Rate limited - use exponential backoff
+                wait_time = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 seconds
+                print(f"  Company lookup rate limited (429). Waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                time.sleep(wait_time)
+            else:
+                print(f"  Company lookup attempt {attempt + 1}/{max_retries}: Got status {company_response.status_code}")
+                time.sleep(2)
+        except Exception as e:
+            print(f"  Company lookup attempt {attempt + 1}/{max_retries}: Request failed - {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
 
-    # print(company_response.json())
+    # Parse company response
+    if company_response is None or company_response.status_code != 200:
+        print(f"Failed to lookup company '{company_name_og}' after {max_retries} attempts. Skipping.")
+        continue
+
     try:
         company_id = company_response.json()[0]['id']
         company_name = company_response.json()[0]['displayName']
-    except:
-        print("Something went wrong trying to find ", company_name_og, company_response.status_code, company_response.content)
+    except (KeyError, IndexError, ValueError) as e:
+        print(f"Failed to parse company data for '{company_name_og}': {e}")
         continue
 
     COMPANY_JOBS_PATH = "/jobs/api/seeMoreJobPostings/search"
@@ -210,13 +235,41 @@ for company_name_og in STARTUP_COMPANY_NAMES:
             "keywords" : "software engineer",
             "start" : job_next_start,
         }
-        jobs_response = requests.get(BASE_SEARCH_URL + COMPANY_JOBS_PATH,jsParams, verify=False)
+
+        # Retry logic for pagination requests with exponential backoff
+        jobs_response = None
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                jobs_response = requests.get(BASE_SEARCH_URL + COMPANY_JOBS_PATH, jsParams, verify=False, timeout=10)
+                if jobs_response.status_code == 200:
+                    break
+                elif jobs_response.status_code == 429:
+                    # Rate limited - use exponential backoff
+                    wait_time = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 seconds
+                    print(f"  Pagination rate limited (429). Waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(wait_time)
+                else:
+                    print(f"  Pagination attempt {attempt + 1}/{max_retries}: Got status {jobs_response.status_code}")
+                    time.sleep(2)
+            except Exception as e:
+                print(f"  Pagination attempt {attempt + 1}/{max_retries}: Request failed - {str(e)}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+
+        # Check if pagination request succeeded
+        if jobs_response is None or jobs_response.status_code != 200:
+            print(f"  Failed to fetch job page after {max_retries} attempts. Stopping pagination for {company_name}.")
+            has_more_jobs = False
+            break
+
         print(jobs_response.url)
         soup = BeautifulSoup(jobs_response.content)
         thisPull = soup.find_all('a', attrs={"class" : "base-card__full-link"})
 
-        # Stop if we get no results OR if we're getting the same results (pagination ended)
+        # Stop if we get no results (pagination ended naturally)
         if len(thisPull) == 0:
+            print(f"  No more jobs found on this page. Pagination complete.")
             has_more_jobs = False
         else:
             job_link_elements += thisPull
@@ -225,7 +278,7 @@ for company_name_og in STARTUP_COMPANY_NAMES:
         print('Pulled jobs for ' + company_name + ":", len(job_link_elements))
 
         # Add delay to avoid rate limiting
-        time.sleep(0.5)
+        time.sleep(2)
 
     print('Total Jobs:', len(job_link_elements))
     jobList = []
@@ -239,21 +292,26 @@ for company_name_og in STARTUP_COMPANY_NAMES:
         partial_link = job_url.split('?')[0]
         jobId = partial_link.split('-')[-1]
 
-        # Retry logic for job detail requests
+        # Retry logic for job detail requests with exponential backoff
         job_desc_response = None
-        max_retries = 3
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 job_desc_response = requests.get(BASE_SEARCH_URL + "/jobs/api/jobPosting/" + jobId, verify=False, timeout=10)
                 if job_desc_response.status_code == 200:
                     break
+                elif job_desc_response.status_code == 429:
+                    # Rate limited - use exponential backoff
+                    wait_time = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 seconds
+                    print(f"  Rate limited (429). Waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
+                    time.sleep(wait_time)
                 else:
                     print(f"  Attempt {attempt + 1}/{max_retries}: Got status {job_desc_response.status_code}")
-                    time.sleep(1)
+                    time.sleep(2)
             except Exception as e:
                 print(f"  Attempt {attempt + 1}/{max_retries}: Request failed - {str(e)}")
                 if attempt < max_retries - 1:
-                    time.sleep(1)
+                    time.sleep(2)
                 else:
                     print(f"  Skipping job after {max_retries} failed attempts")
                     job_desc_response = None
@@ -293,11 +351,16 @@ for company_name_og in STARTUP_COMPANY_NAMES:
                 title = "N/A"
 
 
+            # Extract job ID from URL (the number at the end)
+            job_url_full = job_desc_response.url
+            extracted_job_id = job_url_full.split('/')[-1]
+
             company_jobs.append({
+                "job_id" : extracted_job_id,
                 "desc" : desc,
                 "comp" : comp,
                 "title" : title,
-                "url" : job_desc_response.url,
+                "url" : job_url_full,
                 "loc" : loc,
                 "company" : company_name,
                 "seniority" : seniority,
@@ -310,7 +373,7 @@ for company_name_og in STARTUP_COMPANY_NAMES:
             jobList.append(title)
 
             # Add delay between job detail requests to avoid rate limiting
-            time.sleep(0.3)
+            time.sleep(1)
 
     # Enrich jobs for this company with Claude metadata
     enriched_company_jobs = enrich_jobs_with_claude(company_jobs, company_name)
